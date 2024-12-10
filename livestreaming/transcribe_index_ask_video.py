@@ -5,6 +5,8 @@ import io
 from PIL import Image
 import os
 from dotenv import load_dotenv
+import openai
+from openai import AzureOpenAI
 import numpy as np
 import imagehash
 import av
@@ -18,13 +20,30 @@ from msrest.authentication import CognitiveServicesCredentials
 import subprocess
 import threading
 import requests
+import tiktoken
 from azure.search.documents.indexes.models import (
     SearchIndex,
     SimpleField,
     SearchFieldDataType,
-    SearchableField
+    SearchableField,
+    VectorSearch,
+    SearchField,
+    HnswAlgorithmConfiguration,
+    VectorSearchAlgorithmKind,
+    HnswParameters,
+    VectorSearchAlgorithmMetric,
+    VectorSearchProfile
 )
+from azure.search.documents.models import (
+    VectorizedQuery
+)
+tokenizer = tiktoken.get_encoding("cl100k_base")
 load_dotenv('./keys.env')
+client = AzureOpenAI(
+         azure_endpoint = os.getenv('azure_endpoint'), 
+         api_key=os.getenv('OPENAI_API_KEY'),  
+         api_version=os.getenv('api_version')
+         )
 
 """
 Preamble: The following code handles the backend logic for a tool that addresses a problem in education using AI. During a professor's lecture, students have limited ways to address conceptual misunderstandings. 
@@ -52,69 +71,6 @@ def delete_existing_index():
     except Exception:
         pass
 
-def create_index():
-
-    """Creates or updates both a video and audio keyword search index on Azure."""
-
-    try:
-        fields = [
-            SimpleField(name="id", type=SearchFieldDataType.String, key=True), #unique identifier relative to moment in live lecture
-            SearchableField(name="content", type=SearchFieldDataType.String), #actual data that is searchable
-        ]
-        audio_index = SearchIndex(name=os.getenv('AUDIO_INDEX_NAME'), fields=fields) #creates search index object
-        index_client.create_or_update_index(audio_index) #creates new index if it does not exist or updates index structure if it does exist
-
-        video_index = SearchIndex(name=os.getenv('VIDEO_INDEX_NAME'), fields=fields) #creates search index object
-        index_client.create_or_update_index(video_index) #creates new index if it does not exist or updates index structure if it does exist
-    except Exception:
-        pass
-
-
-def upload_audio_to_index(transcription, transcription_id):
-
-    """
-    Uploads audio transcription to the Azure Search index.
-    
-    Parameters: 
-        transcription: A string containing the text transcription of an audio segment.
-        transcription_id: A unique identifier (string) for the transcription document. 
-
-    """
-
-    try:
-        with index_lock: #ensures that multiple documents can be uploaded to the same index without causing conflicts
-            document = [
-                {
-                    "id": transcription_id,
-                    "content": transcription,
-                }
-            ]
-            audio_search_client.upload_documents(documents=document) #uploads documents to Azure Search index
-    except Exception:
-        pass
-
-def upload_video_to_index(frame, frame_id):
-
-    """
-    Uploads video textual content to Azure Search index.
-
-    Parameters: 
-        frame: A string containing text extracted from a video frame (with OCR).
-        frame_id: A unique identifier (string) for the frame. 
-    """
-    try:
-        with index_lock: #ensures that multiple documents can be uploaded to the same index without causing conflicts
-            document = [
-                {
-                    "id": frame_id,
-                    "content": frame,
-                }
-            ]
-            video_search_client.upload_documents(documents=document) #uploads documents to Azure Search index
-    except Exception as e:
-        print(f"UPLOAD ERROR: {e}")
-        pass
-
 def handle_transcription(evt):
     """
     Processes transcriptions generated from an audio stream, extracts words from the transcription, stores them in a buffer, and uploads the transcription to Azure Search index.
@@ -128,9 +84,103 @@ def handle_transcription(evt):
     words = transcription.split() #splits the transcription into individual words (by spaces)
     with index_lock:  #ensures that multiple items can be uploaded to the same index without causing conflicts
         word_buffer.extend(words) #appends words in transcript to the total of words spoken so far
-    upload_audio_to_index(transcription, f"transcription-{transcription_counter}") #uploads audio transcription to Azure Search index
+    update_vector_index(transcription, f"transcription-{transcription_counter}", audio_search_client, os.getenv('AUDIO_INDEX_NAME'))
     transcription_counter += 1
 
+def generate_embeddings(texts):
+    try:
+        chunks = chunk_text(texts)
+        response = client.embeddings.create(
+            input = chunks,
+            model= "text-embedding-ada-002"
+        )
+        embeddings = [data.embedding for data in response.data]
+        return embeddings
+    except Exception as e:
+        print(f"Error generating embeddings: {e}")
+        return None
+
+def create_vector_index():
+    try:
+        fields = [
+            SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+            SearchableField(name="text", type=SearchFieldDataType.String),
+            SearchField(
+            name="embedding",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            vector_search_dimensions=1536,
+            vector_search_profile_name="my-vector-config")
+        ]
+        vector_search = VectorSearch(
+            algorithms=[
+                HnswAlgorithmConfiguration(
+                    name="my-hnsw",
+                    kind=VectorSearchAlgorithmKind.HNSW,
+                    parameters=HnswParameters(
+                        m=4,
+                        ef_construction=400,
+                        ef_search=500,
+                        metric=VectorSearchAlgorithmMetric.COSINE,
+                    ),
+                )
+            ],
+            profiles=[
+                VectorSearchProfile(
+                    name="my-vector-config",
+                    algorithm_configuration_name="my-hnsw",
+                )
+            ],
+        )
+        audio_index = SearchIndex(name=os.getenv('AUDIO_INDEX_NAME'), fields=fields, vector_search=vector_search)
+        video_index = SearchIndex(name=os.getenv('VIDEO_INDEX_NAME'), fields=fields, vector_search=vector_search)
+        index_client.create_or_update_index(video_index)
+        index_client.create_or_update_index(audio_index)
+        print(f"Index '{os.getenv('AUDIO_INDEX_NAME')}' created successfully.")
+        print(f"Index '{os.getenv('VIDEO_INDEX_NAME')}' created successfully.")
+    except Exception as e:
+        print(f"Vector Index creation failed: {e}")
+
+def chunk_text(texts, max_tokens=int(os.getenv('max_tokens'))):
+    chunks = []
+    current_chunk = []
+    current_token_count = 0
+
+    for text in texts:
+        tokens = tokenizer.encode(text)
+        token_length = len(tokens)
+        
+        if current_token_count + token_length > max_tokens:
+            if current_chunk:
+                chunks.append("".join(current_chunk))
+            current_chunk = [text]
+            current_token_count = token_length
+        else:
+            current_chunk.append(text)
+            current_token_count += token_length
+
+    if current_chunk:
+        chunks.append("".join(current_chunk))
+    
+    return chunks
+
+def update_vector_index(transcription, transcription_id, search_client, client_name):
+    try:
+        with index_lock:
+            chunks = chunk_text(transcription)
+            for chunk in chunks:
+                embeddings = generate_embeddings(chunk)
+                for embedding in embeddings:
+                    document = {
+                        "embedding": embedding,
+                        "text": chunk,
+                        "id": transcription_id
+
+                    }
+                    search_client.upload_documents(documents=document)
+            print(f"successfully uploaded to {client_name} index")
+            # print(chunk)
+    except Exception as e:
+        print(f"Failed to upload transcription: {e}")
 
 def generate_gpt_response(prompt):
 
@@ -192,11 +242,29 @@ def retrieve_top_search_results(query):
     """
 
     try:
-        audio_results = audio_search_client.search(query, top=3) #retrieves the top 3 most relevent audio segments
+        tokens = tokenizer.encode(query)
+        if(len(tokens) > int(os.getenv('max_tokens'))):
+            raise ValueError("query cannot exceed max token length")
+        vector_query = VectorizedQuery(vector=generate_embeddings(query)[0], k_nearest_neighbors=3, fields="embedding")
+        audio_results = audio_search_client.search(  
+            search_text=None,  
+            vector_queries= [vector_query],
+            select=["text"]
+        )
+        audio_rag = [audio['text'] for audio in audio_results]
+        video_results = video_search_client.search(  
+            search_text=None,  
+            vector_queries= [vector_query],
+            select=["text"]
+        )
+        video_rag = [video['text'] for video in video_results]
+        # return texts
+        # audio_results = audio_search_client.search(query, top=3) #retrieves the top 3 most relevent audio segments
         notes_results = notes_search_client.search(query, top=3) #retrieves the top 3 most relevent course note segments
-        video_results = video_search_client.search(query, top=2) #retrieves the top 2 most relevent video segments
-        return [result['content'] for result in audio_results], [result['content'] for result in notes_results], [result['content'] for result in video_results]
+        #video_results = video_search_client.search(query, top=2) #retrieves the top 2 most relevent video segments
+        return audio_rag, [result['content'] for result in notes_results], video_rag
     except Exception as e:
+        print(f"Query failed: {e}")
         return [], [], []
 
 def image_to_stream(pil_image):
@@ -265,7 +333,7 @@ def process_video_stream(stream_url, hash_threshold=2, n=5):
 
                 if is_unique:
                     extracted_text = perform_ocr(frame_pil) #extracts text from the frame using OCR
-                    upload_video_to_index(extracted_text, f"frame-{counter}") #uploads the extracted text to Azure Search index
+                    update_vector_index(extracted_text, f"frame-{counter}", video_search_client, os.getenv('VIDEO_INDEX_NAME'))
                     saved_frame_hashes.append(frame_hash) #adds the frame’s hash to saved_frame_hashes
                     video_buffer.append(extracted_text) #appends extracted text to entire OCR text from video stream
 
@@ -363,21 +431,22 @@ speech_config = speechsdk.SpeechConfig(subscription=os.getenv('speech_key'), reg
 EMBEDDING_MODEL_DIMENSIONS = 1536
 index_client = SearchIndexClient(os.getenv('SEARCH_ENDPOINT'), AzureKeyCredential(os.getenv('SEARCH_KEY')))
 
+print("message before")
 computervision_client = ComputerVisionClient(os.getenv('endpoint'), CognitiveServicesCredentials(os.getenv('subscription_key')))
 audio_search_client = SearchClient(os.getenv('SEARCH_ENDPOINT'), os.getenv('AUDIO_INDEX_NAME'), AzureKeyCredential(os.getenv('SEARCH_KEY')))
 notes_search_client = SearchClient(os.getenv('SEARCH_ENDPOINT'), os.getenv('NOTES_INDEX_NAME'), AzureKeyCredential(os.getenv('SEARCH_KEY')))
 video_search_client = SearchClient(endpoint=os.getenv('SEARCH_ENDPOINT'), index_name=os.getenv('VIDEO_INDEX_NAME'),
                                    credential=AzureKeyCredential(os.getenv('SEARCH_KEY')))
-
+print('message after')
 #initializes storage devices
 index_lock = threading.Lock() #for multiple threading
 word_buffer = deque(maxlen=256) #stores rolling audio transcription
 video_buffer = deque(maxlen=2) #stores rolling video frame OCR
 conversation_history = deque(maxlen=5) #chatbot and user conversation history
-
 #initializes Azure Search indices for live lecture
 delete_existing_index()
-create_index()
+# create_index()
+create_vector_index()
 
 #initializes audio transcription streaming devices
 push_stream = speechsdk.audio.PushAudioInputStream()
